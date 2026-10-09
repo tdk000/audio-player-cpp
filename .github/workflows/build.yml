@@ -1,8 +1,7 @@
 name: build
 
 # Собираем плеер MinGW-w64 и прогоняем все самотесты на каждый push.
-# Сборка статическая, поэтому проверяется ровно тот же сценарий, что и локально:
-# build.bat плюс запуск test_*.exe из корня проекта.
+# Сценарий тот же, что и локально: build.bat плюс запуск test_*.exe из корня.
 on:
   push:
     branches: [main]
@@ -16,8 +15,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # В образе windows-latest нет MinGW-w64, зато msys2 раскладывает его
-      # в привычную структуру mingw64\bin\g++.exe — какую и ждёт build.bat.
+      # В образе windows-latest нет MinGW-w64, поэтому ставим его через msys2.
+      # build.bat сам найдёт g++ и windres в PATH, если по привычному пути пусто.
       - name: Установить MinGW-w64
         uses: msys2/setup-msys2@v2
         with:
@@ -26,22 +25,19 @@ jobs:
           install: mingw-w64-x86_64-gcc
 
       - name: Собрать плеер и тесты
-        shell: cmd
+        shell: msys2 {0}
         run: |
-          set "MINGW_HOME=C:\msys64\mingw64"
-          build.bat
+          cd "${GITHUB_WORKSPACE}"
+          cmd //c build.bat
 
       - name: Прогнать самотесты
-        shell: cmd
+        shell: msys2 {0}
         run: |
-          dist\test_core.exe
-          if errorlevel 1 exit /b 1
-          dist\test_playlist.exe
-          if errorlevel 1 exit /b 1
-          dist\test_tags.exe
-          if errorlevel 1 exit /b 1
-          dist\test_settings.exe
-          if errorlevel 1 exit /b 1
+          cd "${GITHUB_WORKSPACE}"
+          ./dist/test_core.exe
+          ./dist/test_playlist.exe
+          ./dist/test_tags.exe
+          ./dist/test_settings.exe
 
       - name: Сохранить собранное
         uses: actions/upload-artifact@v4
