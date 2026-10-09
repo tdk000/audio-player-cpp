@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <system_error>
 
@@ -69,7 +70,145 @@ PlayerCore::PlayerCore(double volume, Device device) : volume_(clamp01(volume)) 
         throw std::runtime_error(std::string("miniaudio: ") + ma_result_description(result));
     }
     engine_ready_ = true;
+    create_eq_nodes();
     stamp();
+}
+
+// Цепочка фильтров создаётся один раз на весь движок: при смене настроек
+// достаточно пересчитать коэффициенты (apply_eq), а не пересобирать граф.
+void PlayerCore::create_eq_nodes() {
+    if (!engine_ready_ || eq_nodes_ready_) {
+        return;
+    }
+    ma_node_graph* graph = ma_engine_get_node_graph(&engine_);
+    const ma_uint32 channels = ma_engine_get_channels(&engine_);
+    const ma_uint32 sample_rate = ma_engine_get_sample_rate(&engine_);
+
+    ma_loshelf_node_config low = ma_loshelf_node_config_init(channels, sample_rate, 0.0, 0.9, 200.0);
+    if (ma_loshelf_node_init(graph, &low, nullptr, &eq_low_) != MA_SUCCESS) {
+        return;
+    }
+    ma_peak_node_config mid = ma_peak_node_config_init(channels, sample_rate, 0.0, 0.9, 1000.0);
+    if (ma_peak_node_init(graph, &mid, nullptr, &eq_mid_) != MA_SUCCESS) {
+        ma_loshelf_node_uninit(&eq_low_, nullptr);
+        return;
+    }
+    ma_hishelf_node_config high =
+        ma_hishelf_node_config_init(channels, sample_rate, 0.0, 0.9, 4000.0);
+    if (ma_hishelf_node_init(graph, &high, nullptr, &eq_high_) != MA_SUCCESS) {
+        ma_peak_node_uninit(&eq_mid_, nullptr);
+        ma_loshelf_node_uninit(&eq_low_, nullptr);
+        return;
+    }
+
+    // НЧ -> СЧ -> ВЧ -> выход движка. Вход подключается позже, когда появится звук.
+    ma_node_attach_output_bus(reinterpret_cast<ma_node*>(&eq_low_), 0,
+                              reinterpret_cast<ma_node*>(&eq_mid_), 0);
+    ma_node_attach_output_bus(reinterpret_cast<ma_node*>(&eq_mid_), 0,
+                              reinterpret_cast<ma_node*>(&eq_high_), 0);
+    ma_node_attach_output_bus(reinterpret_cast<ma_node*>(&eq_high_), 0,
+                              ma_engine_get_endpoint(&engine_), 0);
+    eq_nodes_ready_ = true;
+}
+
+void PlayerCore::destroy_eq_nodes() {
+    if (!eq_nodes_ready_) {
+        return;
+    }
+    // Отключаем звук от цепочки, иначе он останется ссылаться на удаляемые узлы.
+    if (sound_ != nullptr) {
+        ma_node_attach_output_bus(reinterpret_cast<ma_node*>(sound_), 0,
+                                  ma_engine_get_endpoint(&engine_), 0);
+    }
+    ma_hishelf_node_uninit(&eq_high_, nullptr);
+    ma_peak_node_uninit(&eq_mid_, nullptr);
+    ma_loshelf_node_uninit(&eq_low_, nullptr);
+    eq_nodes_ready_ = false;
+}
+
+// Подключить текущий звук ко входу цепочки. Вызывается после каждой загрузки:
+// ma_sound создаётся заново на каждый файл и по умолчанию идёт прямо на выход.
+void PlayerCore::wire_eq_input() {
+    if (!eq_nodes_ready_ || sound_ == nullptr) {
+        return;
+    }
+    ma_node_attach_output_bus(reinterpret_cast<ma_node*>(sound_), 0,
+                              reinterpret_cast<ma_node*>(&eq_low_), 0);
+}
+
+void PlayerCore::apply_eq() {
+    if (!eq_nodes_ready_) {
+        return;
+    }
+    const ma_uint32 channels = ma_engine_get_channels(&engine_);
+    const ma_uint32 sample_rate = ma_engine_get_sample_rate(&engine_);
+    const double low = eq_enabled_ ? eq_gain_[0] : 0.0;
+    const double mid = eq_enabled_ ? eq_gain_[1] : 0.0;
+    const double high = eq_enabled_ ? eq_gain_[2] : 0.0;
+
+    ma_loshelf_node_config low_config =
+        ma_loshelf_node_config_init(channels, sample_rate, low, 0.9, 200.0);
+    ma_loshelf_node_reinit(&low_config.loshelf, &eq_low_);
+    ma_peak_node_config mid_config =
+        ma_peak_node_config_init(channels, sample_rate, mid, 0.9, 1000.0);
+    ma_peak_node_reinit(&mid_config.peak, &eq_mid_);
+    ma_hishelf_node_config high_config =
+        ma_hishelf_node_config_init(channels, sample_rate, high, 0.9, 4000.0);
+    ma_hishelf_node_reinit(&high_config.hishelf, &eq_high_);
+}
+
+void PlayerCore::set_eq_enabled(bool on) {
+    eq_enabled_ = on;
+    apply_eq();
+}
+
+void PlayerCore::toggle_eq() {
+    set_eq_enabled(!eq_enabled_);
+}
+
+void PlayerCore::set_eq_gain(Band band, double gain_db) {
+    const double clamped = std::max(-kMaxGainDb, std::min(kMaxGainDb, gain_db));
+    eq_gain_[static_cast<int>(band)] = clamped;
+    apply_eq();
+}
+
+void PlayerCore::change_eq_gain(Band band, double delta_db) {
+    set_eq_gain(band, eq_gain(band) + delta_db);
+}
+
+std::string PlayerCore::eq_label() const {
+    auto signed_db = [](double value) {
+        const int rounded = static_cast<int>(std::lround(value * 10.0));
+        const double scaled = rounded / 10.0;
+        char buffer[32];
+        std::snprintf(buffer, sizeof(buffer), "%+.1f", scaled);
+        return std::string(buffer);
+    };
+    if (!eq_nodes_ready_) {
+        return "Эквалайзер недоступен";
+    }
+    if (!eq_enabled_) {
+        return "Эквалайзер: выкл";
+    }
+    return "Эквалайзер: НЧ " + signed_db(eq_gain_[0]) + " · СЧ " + signed_db(eq_gain_[1]) +
+           " · ВЧ " + signed_db(eq_gain_[2]) + " дБ";
+}
+
+// Старт всегда с плавного входа: убирает щелчок в начале трека.
+void PlayerCore::fade_in() {
+    if (sound_ == nullptr) {
+        return;
+    }
+    ma_sound_reset_stop_time_and_fade(sound_);
+    ma_sound_set_fade_in_milliseconds(sound_, 0.0f, 1.0f, static_cast<ma_uint64>(kFadeMs));
+}
+
+// Затухание планируется в звуковом потоке: интерфейс не ждёт окончания.
+void PlayerCore::fade_out() {
+    if (sound_ == nullptr) {
+        return;
+    }
+    ma_sound_stop_with_fade_in_milliseconds(sound_, static_cast<ma_uint64>(kFadeMs));
 }
 
 PlayerCore::~PlayerCore() {
@@ -115,6 +254,8 @@ void PlayerCore::open(const std::string& utf8_path) {
     release_sound();
     sound_ = fresh;
     ma_sound_set_volume(sound_, static_cast<float>(volume_));
+    apply_eq();                                  // коэффициенты могли измениться без звука
+    wire_eq_input();                             // звук идёт через эквалайзер
 
     path_ = path;
     duration_ = media::probe_duration(path);
@@ -147,6 +288,7 @@ void PlayerCore::play(std::optional<double> start) {
         return;
     }
     if (state_ == State::Paused && !start.has_value()) {
+        fade_in();
         ma_sound_start(sound_);                  // продолжение с курсора
         stamp();
         state_ = State::Playing;
@@ -161,6 +303,7 @@ void PlayerCore::play(std::optional<double> start) {
     // её применяет звуковой поток. ma_sound_start() при этом сам сбрасывает
     // флаг «трек доигран» и уходит в начало, после чего применится наша цель.
     ma_sound_seek_to_second(sound_, static_cast<float>(pos));
+    fade_in();
     ma_sound_start(sound_);
     anchor_pos_ = pos;
     stamp();
@@ -190,8 +333,15 @@ void PlayerCore::stop() {
     if (sound_ == nullptr || !has_track()) {
         return;
     }
-    ma_sound_stop(sound_);
-    ma_sound_seek_to_second(sound_, 0.0f);
+    if (state_ == State::Playing) {
+        // Плавное затухание вместо обрыва. Остановку завершает звуковой поток,
+        // поэтому позицию не сбрасываем в звуке — только в своём состоянии:
+        // следующий play() перемотает на начало сам.
+        fade_out();
+    } else {
+        ma_sound_stop(sound_);
+        ma_sound_seek_to_second(sound_, 0.0f);
+    }
     state_ = State::Stopped;
     anchor_pos_ = 0.0;
     stamp();
@@ -250,6 +400,7 @@ double PlayerCore::change_volume(double delta) {
 void PlayerCore::close() {
     unload();
     if (engine_ready_) {
+        destroy_eq_nodes();          // узлы принадлежат графу движка — снимаем до его остановки
         ma_engine_uninit(&engine_);
         engine_ready_ = false;
     }

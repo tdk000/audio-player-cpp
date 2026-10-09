@@ -17,6 +17,18 @@ bool natural_less(const std::string& left, const std::string& right);
 // Аудиофайлы папки (без подпапок), отсортированные по-человечески.
 std::vector<std::string> scan_folder(const std::string& utf8_folder);
 
+// Плейлист-файл: .m3u или .m3u8 (регистр не важен).
+bool is_playlist_file(const std::string& utf8_path);
+
+// Чтение M3U/M3U8. Относительные пути считаются от папки самого плейлиста,
+// вложенные папки раскрываются, отсутствующие файлы и мусор пропускаются,
+// дубликаты убираются. Кодировка — UTF-8 (с BOM или без), при невалидном
+// UTF-8 строка читается как Windows-1251: старые плейлисты пишут именно так.
+std::vector<std::string> read_m3u(const std::string& utf8_file);
+
+// Запись плейлиста в M3U (UTF-8, с #EXTM3U и #EXTINF).
+bool write_m3u(const std::string& utf8_file, const std::vector<std::string>& tracks);
+
 enum class Repeat { Off, All, One };
 
 // Порядок воспроизведения. Знает про перемешивание и повтор, ничего не знает
@@ -24,6 +36,12 @@ enum class Repeat { Off, All, One };
 class Queue {
 public:
     void set_tracks(std::vector<std::string> tracks);
+
+    // Добавить треки в конец, не сбрасывая текущий и не перемешивая уже
+    // сыгранную часть (режим «добавить папку к текущему плейлисту»).
+    // Возвращает число реально добавленных треков: дубликаты отбрасываются.
+    int append_tracks(std::vector<std::string> tracks);
+
     void clear();
 
     bool empty() const { return tracks_.empty(); }

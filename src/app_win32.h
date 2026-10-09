@@ -2,6 +2,7 @@
 #pragma once
 
 #include <windows.h>
+#include <oleidl.h>
 
 #include <string>
 #include <vector>
@@ -9,6 +10,8 @@
 #include "player_core.h"
 #include "playlist.h"
 #include "ui_theme.h"
+
+class PlayerDropTarget;
 
 class PlayerApp {
 public:
@@ -24,6 +27,13 @@ public:
 
     // Горячие клавиши и курсор-«рука» перехватываются до DispatchMessage.
     bool pre_dispatch(MSG& message);
+
+    // --- Перетаскивание через OLE (IDropTarget) ---
+    // Подсветка зоны приёма: рамкой обводим окно, пока над ним несут файлы.
+    void set_drop_active(bool active);
+    bool drop_active() const { return drop_active_; }
+    // Принять данные из объекта OLE: раскрыть папки, прочитать плейлисты.
+    void accept_data_object(IDataObject* data);
 
 private:
     enum : int {
@@ -83,13 +93,25 @@ private:
     void on_timer();
     void refresh();
 
-    bool handle_key(WPARAM key, bool ctrl);
+    bool handle_key(WPARAM key, bool ctrl, bool shift);
 
     void open_file_dialog();
     void open_folder_dialog();
+    void add_folder_dialog();
+    void save_playlist_dialog();
+
+    // Разбор пути из диалога, перетаскивания или командной строки: плейлист
+    // (.m3u/.m3u8), папка или отдельный файл. append — добавить к текущему.
+    bool open_path(const std::string& path, bool append = false);
     bool load_folder(const std::string& folder);
+    bool append_folder(const std::string& folder);
     bool start_playlist(std::vector<std::string> files);
     void accept_dropped_files(HDROP drop);
+    // Общая часть перетаскивания и диалогов: папки раскрываются, плейлисты
+    // читаются, не-аудио отбрасывается, дубликаты убираются.
+    void accept_paths(const std::vector<std::string>& paths, bool dropped);
+    std::vector<std::string> collect_tracks(const std::vector<std::string>& paths, int* folders,
+                                            int* skipped) const;
     bool load(const std::string& path, bool autoplay = true, bool show_errors = true,
               bool reset_playlist = true);
     bool play_from_queue(bool autoplay = true, bool interactive = false);
@@ -112,6 +134,9 @@ private:
     void scroll_list_by(int lines);
     void scroll_list_to(int top);
     void update_volume_label();
+    // Состояние между запусками: %APPDATA%\AudioPlayerCpp\settings.ini.
+    void restore_state();
+    void persist_state();
     std::wstring volume_label_text() const;
     void set_enabled(HWND control, bool enabled);
     void set_status(const std::wstring& text);
@@ -149,6 +174,7 @@ private:
     playlist::Queue queue_;             // порядок воспроизведения и режимы
     std::vector<std::wstring> list_items_;
     std::string last_dir_;
+    std::string settings_path_;         // пусто, если %APPDATA% недоступен
 
     std::wstring track_title_;
     std::wstring track_artist_;
@@ -165,4 +191,7 @@ private:
     bool dragging_position_ = false;
     bool closing_ = false;
     bool crash_logged_ = false;
+    bool drop_active_ = false;         // над окном несут файлы — рисуем рамку приёма
+    int eq_band_ = 0;                   // выбранная полоса эквалайзера (0..2)
+    PlayerDropTarget* drop_target_ = nullptr;
 };

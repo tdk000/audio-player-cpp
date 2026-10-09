@@ -11,9 +11,10 @@ namespace app {
 
 inline constexpr double kSeekStep = 5.0;      // секунд, шаг перемотки стрелками
 inline constexpr double kVolumeStep = 0.05;   // 5 % шага громкости
+inline constexpr double kEqStepDb = 1.5;      // шаг полосы эквалайзера, дБ
 inline constexpr int kTickMs = 200;           // период обновления интерфейса, мс
 inline constexpr double kDefaultVolume = 0.8;
-inline constexpr const char* kVersion = "2.0.0";
+inline constexpr const char* kVersion = "2.1.0";
 
 // Пути, которые принимает плеер.
 inline constexpr const char* kAudioExtensions[] = {".mp3", ".wav", ".ogg", ".oga", ".flac"};

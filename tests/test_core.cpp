@@ -289,6 +289,47 @@ int main() {
     check("poll() вернул True", ended);
     check("состояние stopped", core.state() == PlayerCore::State::Stopped);
 
+    std::printf("Эквалайзер\n");
+    check("цепочка фильтров создана", core.eq_available());
+    check("по умолчанию выключен", !core.eq_enabled());
+    check("полосы по нулям",
+          core.eq_gain(PlayerCore::Band::Low) == 0.0 &&
+              core.eq_gain(PlayerCore::Band::Mid) == 0.0 &&
+              core.eq_gain(PlayerCore::Band::High) == 0.0);
+    check("подпись выключенного", core.eq_label() == "Эквалайзер: выкл", core.eq_label());
+
+    core.set_eq_enabled(true);
+    check("включается", core.eq_enabled());
+    core.change_eq_gain(PlayerCore::Band::Low, 4.0);
+    core.change_eq_gain(PlayerCore::Band::High, -2.0);
+    check("низкие +4 дБ", core.eq_gain(PlayerCore::Band::Low) == 4.0);
+    check("высокие -2 дБ", core.eq_gain(PlayerCore::Band::High) == -2.0);
+    check("подпись с полосами",
+          core.eq_label() == "Эквалайзер: НЧ +4.0 · СЧ +0.0 · ВЧ -2.0 дБ", core.eq_label());
+
+    core.set_eq_gain(PlayerCore::Band::Mid, 999.0);
+    check("усиление ограничено сверху",
+          core.eq_gain(PlayerCore::Band::Mid) == PlayerCore::kMaxGainDb,
+          std::to_string(core.eq_gain(PlayerCore::Band::Mid)));
+    core.set_eq_gain(PlayerCore::Band::Mid, -999.0);
+    check("усиление ограничено снизу",
+          core.eq_gain(PlayerCore::Band::Mid) == -PlayerCore::kMaxGainDb,
+          std::to_string(core.eq_gain(PlayerCore::Band::Mid)));
+
+    core.toggle_eq();
+    check("toggle выключает", !core.eq_enabled());
+    check("полосы при этом сохраняются", core.eq_gain(PlayerCore::Band::Low) == 4.0);
+    core.toggle_eq();
+    check("toggle включает обратно", core.eq_enabled());
+
+    // Эквалайзер не должен мешать воспроизведению: трек играет и останавливается.
+    core.open(wav_path);
+    core.play();
+    check("с включённым эквалайзером играет", core.state() == PlayerCore::State::Playing);
+    core.stop();
+    check("остановка с затуханием", core.state() == PlayerCore::State::Stopped);
+    check("позиция сброшена", core.position() == 0.0, std::to_string(core.position()));
+
     core.close();
     std::filesystem::remove_all(tmp, ec);
 

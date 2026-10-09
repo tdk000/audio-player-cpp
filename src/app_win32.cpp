@@ -16,6 +16,7 @@
 #include "media_probe.h"
 #include "playlist.h"
 #include "resources.h"
+#include "settings.h"
 #include "tags.h"
 #include "ui_slider.h"
 
@@ -23,9 +24,19 @@ namespace {
 
 constexpr const wchar_t* kWindowClass = L"DshAudioPlayerWindow";
 constexpr const wchar_t* kOpenFileFilter =
+    L"Аудио и плейлисты (*.mp3;*.wav;*.ogg;*.oga;*.flac;*.m3u;*.m3u8)\0"
+    L"*.mp3;*.wav;*.ogg;*.oga;*.flac;*.m3u;*.m3u8\0"
     L"Аудио (*.mp3;*.wav;*.ogg;*.oga;*.flac)\0*.mp3;*.wav;*.ogg;*.oga;*.flac\0"
-    L"MP3 (*.mp3)\0*.mp3\0"
+    L"Плейлисты (*.m3u;*.m3u8)\0*.m3u;*.m3u8\0"
     L"Все файлы (*.*)\0*.*\0\0";
+
+// Куда сохранять плейлист: только M3U, чтобы список открывался любым плеером.
+constexpr const wchar_t* kSavePlaylistFilter =
+    L"Плейлист M3U (*.m3u)\0*.m3u\0"
+    L"Плейлист M3U8 (*.m3u8)\0*.m3u8\0\0";
+
+// Названия полос эквалайзера — для строки состояния.
+constexpr const wchar_t* kEqBandNames[3] = {L"низкие", L"средние", L"высокие"};
 
 typedef UINT(WINAPI* GetDpiForWindowProc)(HWND);
 
@@ -75,7 +86,168 @@ bool is_playable_candidate(const std::string& utf8_path) {
     return media::sniff_format(utf8_path) != media::Format::Unknown;
 }
 
+// Выбор папки: современный IFileOpenDialog, при неудаче — старый SHBrowseForFolder.
+// Используется и для «Открыть папку», и для «Добавить папку».
+std::wstring pick_folder(HWND owner, const wchar_t* title, const std::string& start_dir) {
+    std::wstring folder;
+    IFileOpenDialog* dialog = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&dialog)))) {
+        DWORD options = 0;
+        dialog->GetOptions(&options);
+        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        dialog->SetTitle(title);
+        if (!start_dir.empty()) {
+            IShellItem* start = nullptr;
+            if (SUCCEEDED(SHCreateItemFromParsingName(app::utf8_to_wide(start_dir).c_str(), nullptr,
+                                                      IID_PPV_ARGS(&start)))) {
+                dialog->SetFolder(start);
+                start->Release();
+            }
+        }
+        if (SUCCEEDED(dialog->Show(owner))) {
+            IShellItem* result = nullptr;
+            if (SUCCEEDED(dialog->GetResult(&result))) {
+                PWSTR value = nullptr;
+                if (SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &value))) {
+                    folder = value;
+                    CoTaskMemFree(value);
+                }
+                result->Release();
+            }
+        }
+        dialog->Release();
+    }
+
+    if (folder.empty()) {                       // запасной путь для старых систем
+        BROWSEINFOW browse{};
+        browse.hwndOwner = owner;
+        browse.lpszTitle = title;
+        browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+        LPITEMIDLIST item = SHBrowseForFolderW(&browse);
+        if (item != nullptr) {
+            wchar_t path[MAX_PATH] = {0};
+            if (SHGetPathFromIDListW(item, path)) {
+                folder = path;
+            }
+            CoTaskMemFree(item);
+        }
+    }
+    return folder;
+}
+
+// Пути из объекта OLE-перетаскивания. Explorer и Проводник кладут список
+// файлов форматом CF_HDROP — тот же, что приходит в WM_DROPFILES.
+bool paths_from_data_object(IDataObject* data, std::vector<std::string>& paths) {
+    if (data == nullptr) {
+        return false;
+    }
+    FORMATETC format{};
+    format.cfFormat = CF_HDROP;
+    format.dwAspect = DVASPECT_CONTENT;
+    format.lindex = -1;
+    format.tymed = TYMED_HGLOBAL;
+
+    STGMEDIUM medium{};
+    if (FAILED(data->GetData(&format, &medium))) {
+        return false;
+    }
+
+    bool ok = false;
+    if (medium.tymed == TYMED_HGLOBAL && medium.hGlobal != nullptr) {
+        auto* drop = static_cast<HDROP>(GlobalLock(medium.hGlobal));
+        if (drop != nullptr) {
+            const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < count; ++i) {
+                const UINT length = DragQueryFileW(drop, i, nullptr, 0);
+                if (length == 0) {
+                    continue;
+                }
+                std::wstring buffer(static_cast<size_t>(length) + 1, L'\0');
+                if (DragQueryFileW(drop, i, buffer.data(), length + 1) == 0) {
+                    continue;
+                }
+                buffer.resize(length);
+                paths.push_back(app::wide_to_utf8(buffer));
+            }
+            GlobalUnlock(medium.hGlobal);
+            ok = true;
+        }
+    }
+    ReleaseStgMedium(&medium);
+    return ok;
+}
+
 }  // namespace
+
+// Приём перетаскивания по правилам OLE: Windows сама сообщает о входе курсора
+// в окно, движении и отпускании — поэтому зону приёма можно подсветить заранее,
+// чего WM_DROPFILES не позволяет. Старый путь оставлен как запасной.
+class PlayerDropTarget : public IDropTarget {
+public:
+    explicit PlayerDropTarget(PlayerApp* app) : app_(app) {}
+    // Виртуальный деструктор: Release() удаляет объект через указатель на
+    // интерфейс, без него удаление полиморфного класса — неопределённое поведение.
+    virtual ~PlayerDropTarget() = default;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** object) override {
+        if (object == nullptr) {
+            return E_POINTER;
+        }
+        if (id == IID_IUnknown || id == IID_IDropTarget) {
+            *object = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs_); }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = InterlockedDecrement(&refs_);
+        if (left == 0) {
+            delete this;
+        }
+        return left;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD, POINTL, DWORD* effect) override {
+        std::vector<std::string> paths;
+        const bool has_files = paths_from_data_object(data, paths) && !paths.empty();
+        app_->set_drop_active(has_files);        // подсветку включаем только под файлы
+        if (effect != nullptr) {
+            *effect = has_files ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD* effect) override {
+        if (effect != nullptr) {
+            *effect = app_->drop_active() ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        app_->set_drop_active(false);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD, POINTL, DWORD* effect) override {
+        app_->set_drop_active(false);
+        if (effect != nullptr) {
+            *effect = DROPEFFECT_COPY;
+        }
+        app_->accept_data_object(data);
+        return S_OK;
+    }
+
+private:
+    LONG refs_ = 1;
+    PlayerApp* app_ = nullptr;
+};
 
 PlayerApp::PlayerApp(PlayerCore& core) : core_(core) {
     wchar_t profile[MAX_PATH] = {0};
@@ -129,9 +301,17 @@ bool PlayerApp::create(HINSTANCE instance) {
                               CW_USEDEFAULT, frame.right - frame.left, frame.bottom - frame.top,
                               nullptr, nullptr, instance, this);
     if (window_ != nullptr) {
-        // Перетаскивание файлов и папок в окно: WM_DROPFILES + курсор «копировать»
-        // от самой Windows (флаг WS_EX_ACCEPTFILES).
+        // Основной путь — OLE-перетаскивание: Windows сообщает о входе курсора
+        // в окно, поэтому зону приёма видно до того, как файлы отпустят.
+        // WM_DROPFILES (WS_EX_ACCEPTFILES) оставлен запасным: если регистрация
+        // IDropTarget не удалась, перетаскивание всё равно работает.
+        drop_target_ = new PlayerDropTarget(this);
+        if (FAILED(RegisterDragDrop(window_, drop_target_))) {
+            drop_target_->Release();
+            drop_target_ = nullptr;
+        }
         DragAcceptFiles(window_, TRUE);
+        restore_state();                   // вернуть громкость, режимы, плейлист и позицию
     }
     return window_ != nullptr;
 }
@@ -163,7 +343,8 @@ bool PlayerApp::pre_dispatch(MSG& message) {
     }
     if (message.message == WM_KEYDOWN) {
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        return handle_key(message.wParam, ctrl);
+        const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        return handle_key(message.wParam, ctrl, shift);
     }
     if (message.message == WM_MOUSEMOVE) {
         // Подсветка кнопки под курсором: у стандартной ownerdraw-кнопки её нет
@@ -204,14 +385,24 @@ bool PlayerApp::pre_dispatch(MSG& message) {
     return false;
 }
 
-bool PlayerApp::handle_key(WPARAM key, bool ctrl) {
+bool PlayerApp::handle_key(WPARAM key, bool ctrl, bool shift) {
     if (ctrl) {
         switch (key) {
             case 'O':
-                open_file_dialog();
+                // Ctrl+Shift+O — добавить папку к текущему плейлисту, не сбрасывая его.
+                if (shift) {
+                    add_folder_dialog();
+                } else {
+                    open_file_dialog();
+                }
                 return true;
             case 'S':
-                stop_playback();
+                // Ctrl+Shift+S — сохранить плейлист в M3U.
+                if (shift) {
+                    save_playlist_dialog();
+                } else {
+                    stop_playback();
+                }
                 return true;
             case VK_LEFT:
                 prev_track();
@@ -219,6 +410,27 @@ bool PlayerApp::handle_key(WPARAM key, bool ctrl) {
             case VK_RIGHT:
                 next_track();
                 return true;
+            case '1':
+            case '2':
+            case '3': {
+                eq_band_ = static_cast<int>(key - '1');   // выбрать полосу эквалайзера
+                set_status(std::wstring(L"Полоса: ") + kEqBandNames[eq_band_] + L" — " +
+                           app::utf8_to_wide(core_.eq_label()));
+                return true;
+            }
+            case VK_UP:
+            case VK_DOWN: {
+                // Ctrl+стрелки двигают выбранную полосу, обычные — громкость.
+                const double step =
+                    key == VK_UP ? app::kEqStepDb : -app::kEqStepDb;
+                core_.change_eq_gain(static_cast<PlayerCore::Band>(eq_band_), step);
+                if (!core_.eq_enabled()) {
+                    core_.set_eq_enabled(true);           // правка полосы включает эквалайзер
+                }
+                set_status(app::utf8_to_wide(core_.eq_label()));
+                refresh();
+                return true;
+            }
             default:
                 break;
         }
@@ -251,6 +463,13 @@ bool PlayerApp::handle_key(WPARAM key, bool ctrl) {
             return true;
         case 'R':
             cycle_repeat_mode();
+            return true;
+        case 'E':
+            // Эквалайзер: включить/выключить. Полосы выбираются Ctrl+1..3,
+            // усиление — Ctrl+стрелки вверх/вниз.
+            core_.toggle_eq();
+            set_status(app::utf8_to_wide(core_.eq_label()));
+            refresh();
             return true;
         case VK_ESCAPE:
             SendMessageW(window_, WM_CLOSE, 0, 0);
@@ -367,8 +586,14 @@ LRESULT PlayerApp::handle(HWND window, UINT message, WPARAM wparam, LPARAM lpara
             closing_ = true;
             KillTimer(window_, 1);
             if (window_ != nullptr) {
+                if (drop_target_ != nullptr) {
+                    RevokeDragDrop(window_);
+                    drop_target_->Release();       // OLE уже отпустил свою ссылку
+                    drop_target_ = nullptr;
+                }
                 DragAcceptFiles(window_, FALSE);
             }
+            persist_state();               // запомнить громкость, режимы, плейлист и позицию
             core_.close();
             DestroyWindow(window_);
             return 0;
@@ -604,8 +829,24 @@ void PlayerApp::paint(HDC dc) {
     if (queue_.empty()) {
         // Список скрыт, поэтому место плейлиста занимает подсказка.
         theme::fill_round_rect(memory, layout_.list, px(6.0), theme::kPanel);
-        draw_text(memory, L"Перетащите сюда аудиофайлы или папку", layout_.list, fonts_.normal,
-                  theme::kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        const wchar_t* hint = drop_active_ ? L"Отпустите — добавим в плейлист"
+                                           : L"Перетащите сюда аудиофайлы или папку";
+        draw_text(memory, hint, layout_.list, fonts_.normal,
+                  drop_active_ ? theme::kAccentHot : theme::kMuted,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    // Зона приёма: пока над окном несут файлы, обводим его рамкой. Рисуется
+    // последней, чтобы оказаться поверх содержимого.
+    if (drop_active_) {
+        HBRUSH accent = CreateSolidBrush(theme::kAccent);
+        RECT frame = client;
+        const int thickness = px(3.0);
+        for (int i = 0; i < thickness; ++i) {
+            FrameRect(memory, &frame, accent);
+            InflateRect(&frame, -1, -1);
+        }
+        DeleteObject(accent);
     }
 
     BitBlt(dc, 0, 0, width, height, memory, 0, 0, SRCCOPY);
@@ -1056,15 +1297,171 @@ bool PlayerApp::start_playlist(std::vector<std::string> files) {
     return play_from_queue(true, true);
 }
 
-// Что делать с перетащенным в окно: папки раскрываются, отдельные файлы берутся
-// как есть, явный мусор отбрасывается. HDROP освобождает вызывающий.
-void PlayerApp::accept_dropped_files(HDROP drop) {
-    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+// Добавить содержимое папки в конец текущего плейлиста, не сбивая воспроизведение.
+bool PlayerApp::append_folder(const std::string& folder) {
+    std::vector<std::string> files = playlist::scan_folder(folder);
+    if (files.empty()) {
+        return false;
+    }
+    last_dir_ = folder;
+    const size_t before = static_cast<size_t>(queue_.size());
+    const int added = queue_.append_tracks(std::move(files));
+    if (added == 0) {
+        set_status(L"Эти треки уже в плейлисте");
+        return false;
+    }
+    list_items_.clear();
+    update_mode_buttons();
+    sync_playlist_view();
+    refresh();
+    const std::wstring text = std::wstring(queue_.empty() && before == 0 ? L"В плейлисте: " : L"Добавлено: ") +
+                              std::to_wstring(added) + L" (всего " +
+                              std::to_wstring(queue_.size()) + L")";
+    set_status(text);
+    if (before == 0) {                      // плейлист был пуст — сразу и играем
+        play_from_queue(true, true);
+    }
+    return true;
+}
+
+// Единая точка входа для диалогов, командной строки и перетаскивания:
+// плейлист-файл, папка или отдельный трек.
+bool PlayerApp::open_path(const std::string& path, bool append) {
+    std::error_code ec;
+    if (playlist::is_playlist_file(path)) {
+        std::vector<std::string> tracks = playlist::read_m3u(path);
+        if (tracks.empty()) {
+            set_status(L"В плейлисте нет доступных аудиофайлов");
+            return false;
+        }
+        last_dir_ = parent_folder(path);
+        if (append) {
+            const int added = queue_.append_tracks(std::move(tracks));
+            list_items_.clear();
+            update_mode_buttons();
+            sync_playlist_view();
+            refresh();
+            if (added == 0) {
+                set_status(L"Эти треки уже в плейлисте");
+                return false;
+            }
+            set_status(L"Добавлено из плейлиста: " + std::to_wstring(added));
+            return true;
+        }
+        return start_playlist(std::move(tracks));
+    }
+    if (std::filesystem::is_directory(app::path_from_utf8(path), ec)) {
+        return append ? append_folder(path) : load_folder(path);
+    }
+    if (append) {
+        const int added = queue_.append_tracks({path});
+        if (added > 0) {
+            list_items_.clear();
+            sync_playlist_view();
+            refresh();
+            set_status(L"Добавлено: " + file_name(path));
+        }
+        return added > 0;
+    }
+    return load(path);
+}
+
+// Собрать треки из произвольных путей: папки раскрываются, плейлисты читаются,
+// не-аудио отбрасывается, дубликаты убираются. folders/skipped — для статуса.
+std::vector<std::string> PlayerApp::collect_tracks(const std::vector<std::string>& paths,
+                                                   int* folders, int* skipped) const {
     std::vector<std::string> tracks;
     std::set<std::string> seen;
-    int dropped_folders = 0;
-    int skipped = 0;
+    for (const std::string& path : paths) {
+        std::error_code ec;
+        std::vector<std::string> batch;
+        if (std::filesystem::is_directory(app::path_from_utf8(path), ec)) {
+            if (folders != nullptr) {
+                ++*folders;
+            }
+            batch = playlist::scan_folder(path);      // внутри папки — естественный порядок
+            if (batch.empty() && skipped != nullptr) {
+                ++*skipped;
+            }
+        } else if (std::filesystem::is_regular_file(app::path_from_utf8(path), ec)) {
+            if (playlist::is_playlist_file(path)) {
+                batch = playlist::read_m3u(path);     // плейлист внутри плейлиста раскрываем
+                if (batch.empty() && skipped != nullptr) {
+                    ++*skipped;
+                }
+            } else if (is_playable_candidate(path)) {
+                batch.push_back(path);
+            } else if (skipped != nullptr) {
+                ++*skipped;
+            }
+        }
+        for (const std::string& track : batch) {
+            if (seen.insert(track).second) {
+                tracks.push_back(track);
+            }
+        }
+    }
+    return tracks;
+}
 
+// Общая обработка набора путей. Shift при перетаскивании — добавить, а не заменить.
+void PlayerApp::accept_paths(const std::vector<std::string>& paths, bool dropped) {
+    int folders = 0;
+    int skipped = 0;
+    std::vector<std::string> tracks = collect_tracks(paths, &folders, &skipped);
+    const std::wstring verb = dropped ? L"Перетащено треков: " : L"Треков: ";
+
+    if (tracks.empty()) {
+        set_status(paths.size() > 1 ? L"В перетащенном нет аудиофайлов" : L"Это не аудиофайл");
+        return;
+    }
+
+    const bool append = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    if (append) {
+        const size_t before = tracks.size();
+        const int added = queue_.append_tracks(std::move(tracks));
+        list_items_.clear();
+        update_mode_buttons();
+        sync_playlist_view();
+        refresh();
+        if (added == 0) {
+            set_status(L"Все эти треки уже в плейлисте");
+            return;
+        }
+        std::wstring text = L"Добавлено: " + std::to_wstring(added) + L" из " +
+                            std::to_wstring(before) + L" (всего " +
+                            std::to_wstring(queue_.size()) + L")";
+        if (skipped > 0) {
+            text += L", пропущено: " + std::to_wstring(skipped);
+        }
+        set_status(text);
+        return;
+    }
+
+    if (tracks.size() == 1) {                             // один файл — как «Открыть файл»
+        load(tracks.front());
+        return;
+    }
+
+    last_dir_ = parent_folder(tracks.front());
+    const size_t total = tracks.size();
+    if (start_playlist(std::move(tracks))) {
+        std::wstring text = verb + std::to_wstring(total);
+        if (folders > 1) {
+            text += L" (папок: " + std::to_wstring(folders) + L")";
+        }
+        if (skipped > 0) {
+            text += L", пропущено: " + std::to_wstring(skipped);
+        }
+        set_status(text);
+    }
+}
+
+// Что делать с перетащенным в окно: HDROP освобождает вызывающий.
+void PlayerApp::accept_dropped_files(HDROP drop) {
+    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    std::vector<std::string> paths;
+    paths.reserve(count);
     for (UINT i = 0; i < count; ++i) {
         const UINT length = DragQueryFileW(drop, i, nullptr, 0);
         if (length == 0) {
@@ -1075,52 +1472,29 @@ void PlayerApp::accept_dropped_files(HDROP drop) {
             continue;
         }
         buffer.resize(length);
-        const std::string path = app::wide_to_utf8(buffer);
-
-        std::error_code ec;
-        std::vector<std::string> batch;
-        if (std::filesystem::is_directory(app::path_from_utf8(path), ec)) {
-            ++dropped_folders;
-            batch = playlist::scan_folder(path);          // внутри папки — естественный порядок
-            if (batch.empty()) {
-                ++skipped;
-            }
-        } else if (std::filesystem::is_regular_file(app::path_from_utf8(path), ec)) {
-            if (is_playable_candidate(path)) {
-                batch.push_back(path);
-            } else {
-                ++skipped;
-            }
-        }
-
-        for (const std::string& track : batch) {
-            if (seen.insert(track).second) {              // дубликаты не нужны
-                tracks.push_back(track);
-            }
-        }
+        paths.push_back(app::wide_to_utf8(buffer));
     }
+    accept_paths(paths, true);
+}
 
-    if (tracks.empty()) {
-        set_status(count > 1 ? L"В перетащенном нет аудиофайлов" : L"Это не аудиофайл");
+// Подсветка зоны приёма: рамка вокруг окна, пока над ним несут файлы.
+void PlayerApp::set_drop_active(bool active) {
+    if (drop_active_ == active) {
         return;
     }
-    if (tracks.size() == 1) {                             // один файл — как «Открыть файл»
-        load(tracks.front());
+    drop_active_ = active;
+    if (window_ != nullptr) {
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+}
+
+void PlayerApp::accept_data_object(IDataObject* data) {
+    std::vector<std::string> paths;
+    if (!paths_from_data_object(data, paths) || paths.empty()) {
+        set_status(L"Не удалось прочитать перетащенные файлы");
         return;
     }
-
-    last_dir_ = parent_folder(tracks.front());
-    const size_t total = tracks.size();
-    if (start_playlist(std::move(tracks))) {
-        std::wstring text = L"Перетащено треков: " + std::to_wstring(total);
-        if (dropped_folders > 1) {
-            text += L" (папок: " + std::to_wstring(dropped_folders) + L")";
-        }
-        if (skipped > 0) {
-            text += L", пропущено: " + std::to_wstring(skipped);
-        }
-        set_status(text);
-    }
+    accept_paths(paths, true);
 }
 
 void PlayerApp::next_track() {
@@ -1265,55 +1639,12 @@ void PlayerApp::open_file_dialog() {
     dialog.lpstrInitialDir = last_dir_.empty() ? nullptr : app::utf8_to_wide(last_dir_).c_str();
     dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
     if (GetOpenFileNameW(&dialog) != FALSE) {
-        load(app::wide_to_utf8(path));
+        open_path(app::wide_to_utf8(path));      // файл, папка или плейлист .m3u
     }
 }
 
 void PlayerApp::open_folder_dialog() {
-    std::wstring folder;
-    IFileOpenDialog* dialog = nullptr;
-    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
-                                   IID_PPV_ARGS(&dialog)))) {
-        DWORD options = 0;
-        dialog->GetOptions(&options);
-        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-        dialog->SetTitle(L"Выберите папку с аудио");
-        if (!last_dir_.empty()) {
-            IShellItem* start = nullptr;
-            if (SUCCEEDED(SHCreateItemFromParsingName(app::utf8_to_wide(last_dir_).c_str(), nullptr,
-                                                      IID_PPV_ARGS(&start)))) {
-                dialog->SetFolder(start);
-                start->Release();
-            }
-        }
-        if (SUCCEEDED(dialog->Show(window_))) {
-            IShellItem* result = nullptr;
-            if (SUCCEEDED(dialog->GetResult(&result))) {
-                PWSTR value = nullptr;
-                if (SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &value))) {
-                    folder = value;
-                    CoTaskMemFree(value);
-                }
-                result->Release();
-            }
-        }
-        dialog->Release();
-    }
-
-    if (folder.empty()) {                       // запасной путь для старых систем
-        BROWSEINFOW browse{};
-        browse.hwndOwner = window_;
-        browse.lpszTitle = L"Выберите папку с аудио";
-        browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-        LPITEMIDLIST item = SHBrowseForFolderW(&browse);
-        if (item != nullptr) {
-            wchar_t path[MAX_PATH] = {0};
-            if (SHGetPathFromIDListW(item, path)) {
-                folder = path;
-            }
-            CoTaskMemFree(item);
-        }
-    }
+    const std::wstring folder = pick_folder(window_, L"Выберите папку с аудио", last_dir_);
     if (folder.empty()) {
         return;
     }
@@ -1330,6 +1661,53 @@ void PlayerApp::open_folder_dialog() {
     }
 }
 
+// Добавить папку в конец текущего плейлиста (Ctrl+Shift+O).
+void PlayerApp::add_folder_dialog() {
+    const std::wstring folder = pick_folder(window_, L"Добавьте папку в плейлист", last_dir_);
+    if (folder.empty()) {
+        return;
+    }
+    const std::string utf8_folder = app::wide_to_utf8(folder);
+    if (playlist::scan_folder(utf8_folder).empty()) {
+        const std::wstring text = L"В папке нет аудиофайлов:\n" + folder;
+        MessageBoxW(window_, text.c_str(), L"Папка пуста", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    append_folder(utf8_folder);        // «уже в плейлисте» append_folder скажет сам
+}
+
+// Сохранить текущий плейлист в M3U (Ctrl+Shift+S).
+void PlayerApp::save_playlist_dialog() {
+    if (queue_.empty()) {
+        set_status(L"Плейлист пуст — сохранять нечего");
+        return;
+    }
+    wchar_t path[MAX_PATH * 4] = {0};
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = window_;
+    dialog.lpstrFilter = kSavePlaylistFilter;
+    dialog.lpstrFile = path;
+    dialog.nMaxFile = sizeof(path) / sizeof(path[0]);
+    dialog.lpstrTitle = L"Сохранить плейлист";
+    dialog.lpstrDefExt = L"m3u";
+    dialog.lpstrInitialDir = last_dir_.empty() ? nullptr : app::utf8_to_wide(last_dir_).c_str();
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
+    if (GetSaveFileNameW(&dialog) == FALSE) {
+        return;                                  // пользователь отменил — это не ошибка
+    }
+
+    const std::string file = app::wide_to_utf8(path);
+    if (playlist::write_m3u(file, queue_.tracks())) {
+        last_dir_ = parent_folder(file);
+        set_status(L"Плейлист сохранён: " + file_name(file));
+    } else {
+        MessageBoxW(window_, L"Не удалось записать файл плейлиста.", L"Ошибка сохранения",
+                    MB_OK | MB_ICONERROR);
+        set_status(L"Не удалось сохранить плейлист");
+    }
+}
+
 void PlayerApp::open_from_command_line(const std::string& utf8_path) {
     std::error_code ec;
     const std::filesystem::path path = app::path_from_utf8(utf8_path);
@@ -1339,7 +1717,98 @@ void PlayerApp::open_from_command_line(const std::string& utf8_path) {
         }
         return;
     }
-    load(utf8_path);
+    // Через open_path: в командной строке может прийти и .m3u.
+    open_path(utf8_path);
+}
+
+// --------------------------------------------------------------------------- //
+//  Состояние между запусками
+// --------------------------------------------------------------------------- //
+void PlayerApp::restore_state() {
+    settings_path_ = settings::default_path();
+    settings::State state;
+    if (settings_path_.empty() || !settings::load(settings_path_, state)) {
+        return;                                  // первый запуск: настроек ещё нет
+    }
+
+    core_.set_volume(state.volume);
+    if (slider_volume_ != nullptr) {
+        Slider::set_value(slider_volume_, std::lround(state.volume * 100.0));
+    }
+    update_volume_label();
+
+    queue_.set_repeat(static_cast<playlist::Repeat>(state.repeat));
+    queue_.set_shuffle(state.shuffle);
+    core_.set_eq_gain(PlayerCore::Band::Low, state.eq_gain[0]);
+    core_.set_eq_gain(PlayerCore::Band::Mid, state.eq_gain[1]);
+    core_.set_eq_gain(PlayerCore::Band::High, state.eq_gain[2]);
+    core_.set_eq_enabled(state.eq_enabled);
+    update_mode_buttons();
+
+    if (state.playlist.empty()) {
+        refresh();
+        return;
+    }
+
+    queue_.set_tracks(state.playlist);
+    // Курсор ставим на трек, который играл. Если его в списке уже нет
+    // (файл переименовали), берём сохранённый индекс.
+    int index = -1;
+    if (!state.track.empty()) {
+        const std::vector<std::string>& tracks = queue_.tracks();
+        for (size_t i = 0; i < tracks.size(); ++i) {
+            if (tracks[i] == state.track) {
+                index = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+    if (index < 0 && state.playlist_index >= 0 && state.playlist_index < queue_.size()) {
+        index = state.playlist_index;
+    }
+    const bool has_track = index >= 0;
+    const std::string track = has_track ? queue_.tracks()[static_cast<size_t>(index)] : std::string();
+    if (has_track) {
+        queue_.jump_to(index);
+    }
+
+    sync_playlist_view();
+    if (!has_track || !load(track, false, false, false)) {
+        set_status(L"Плейлист восстановлен");
+        refresh();
+        return;
+    }
+
+    // Загружено, но не играет: пользователь сам решит, продолжать ли с места.
+    if (state.position > 0.0) {
+        core_.seek(state.position);
+        Slider::set_value(slider_position_, state.position);
+        set_status(L"Продолжить с " + app::utf8_to_wide(app::format_time(state.position)) +
+                   L" — пробел");
+    } else {
+        set_status(L"Плейлист восстановлен — пробел");
+    }
+    highlight_current();
+    refresh();
+}
+
+void PlayerApp::persist_state() {
+    if (settings_path_.empty()) {
+        return;
+    }
+    settings::State state;
+    state.volume = core_.volume();
+    state.shuffle = queue_.shuffle();
+    state.repeat = static_cast<int>(queue_.repeat());
+    state.eq_enabled = core_.eq_enabled();
+    state.eq_gain[0] = core_.eq_gain(PlayerCore::Band::Low);
+    state.eq_gain[1] = core_.eq_gain(PlayerCore::Band::Mid);
+    state.eq_gain[2] = core_.eq_gain(PlayerCore::Band::High);
+    state.track = core_.path();
+    state.position = core_.position();
+    state.playlist = queue_.tracks();
+    state.playlist_index = queue_.current();
+    settings::save(settings_path_, state);
 }
 
 void PlayerApp::log_crash(const char* what) {
