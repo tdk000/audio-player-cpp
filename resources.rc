@@ -1,0 +1,39 @@
+#include <windows.h>
+
+#include "resources.h"
+
+// Значок окна и панели задач — тот же app.ico, что и в Python-версии.
+IDI_APPICON ICON "app.ico"
+
+// Манифест здесь намеренно не встраивается: windres кладёт RT_MANIFEST сразу
+// под два идентификатора (CREATEPROCESS и ISOLATIONAWARE), а линковщик MinGW
+// не умеет их сливать — получается «multiple non-default manifests».
+// Осведомлённость о DPI выставляется кодом (main.cpp), а подсветка кнопок
+// под курсором нарисована вручную (app_win32.cpp), поэтому манифест не нужен.
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 2,0,0,0
+PRODUCTVERSION 2,0,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "AudioPlayer - simple audio player (C++/Win32, miniaudio)"
+            VALUE "FileVersion", "2.0.0.0"
+            VALUE "InternalName", "AudioPlayer"
+            VALUE "OriginalFilename", "AudioPlayer.exe"
+            VALUE "ProductName", "AudioPlayer"
+            VALUE "ProductVersion", "2.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

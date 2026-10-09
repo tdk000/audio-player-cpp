@@ -1,0 +1,21 @@
+# Артефакты сборки
+build/
+*.o
+*.obj
+*.ilk
+*.pdb
+
+# Архивы сборок (сами .exe в dist остаются в репозитории — см. README)
+dist/*.zip
+
+# IDE и редакторы
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Прочее
+Thumbs.db
+desktop.ini
+__pycache__/
