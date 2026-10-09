@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/common.h"
 #include "../src/tags.h"
 
 namespace {
@@ -543,24 +544,87 @@ void test_utf8_path_cyrillic() {
 // ---------------------------------------------------------------------------
 // Реальные файлы
 // ---------------------------------------------------------------------------
-const char* kRealFiles[] = {
-    "C:\\Users\\1\\Desktop\\audio-player-cpp\\test-media\\01-test-tone-440hz-10s.mp3",
-    "C:\\Users\\1\\Desktop\\audio-player-cpp\\test-media\\02-test-sweep-80-12000hz-60s.mp3",
-    "C:\\Users\\1\\Desktop\\audio-player-cpp\\test-media\\03-ode-to-joy-synth-40s.mp3",
+// Имена дорожек без пути: каталог вычисляется на месте, поэтому тест работает
+// и на машине автора, и в CI, где проект лежит совсем в другом месте.
+const wchar_t* kRealNames[] = {
+    L"01-test-tone-440hz-10s.mp3",
+    L"02-test-sweep-80-12000hz-60s.mp3",
+    L"03-ode-to-joy-synth-40s.mp3",
 };
 
 std::vector<tags::Info> g_real_info;
 
-bool file_exists(const char* path) {
-    const DWORD attr = GetFileAttributesA(path);
-    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+bool file_exists_w(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::string utf8_from_wide(const std::wstring& text) {
+    if (text.empty()) {
+        return std::string();
+    }
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    if (size <= 0) {
+        return std::string();
+    }
+    std::string result(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                        result.data(), size, nullptr, nullptr);
+    return result;
+}
+
+bool file_exists_utf8(const std::string& path) {
+    return file_exists_w(app::utf8_to_wide(path));
+}
+
+// Каталог проекта: exe лежит в <корень>\dist, поэтому поднимаемся на два уровня.
+std::wstring project_root() {
+    wchar_t exe[MAX_PATH] = {0};
+    const DWORD length = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return std::wstring();
+    }
+    std::wstring path(exe, length);
+    for (int i = 0; i < 2; ++i) {
+        const size_t slash = path.find_last_of(L"\\/");
+        if (slash == std::wstring::npos) {
+            return std::wstring();
+        }
+        path.erase(slash);
+    }
+    return path;
+}
+
+// Сначала ищем дорожки рядом с exe, затем относительно текущего каталога —
+// так тест работает и из dist\, и запущенным из корня проекта.
+const std::vector<std::string>& real_files() {
+    static const std::vector<std::string> files = [] {
+        std::vector<std::string> result;
+        const std::wstring root = project_root();
+        for (const wchar_t* name : kRealNames) {
+            const std::wstring from_exe =
+                root.empty() ? (L"test-media\\" + std::wstring(name))
+                             : (root + L"\\test-media\\" + name);
+            const std::wstring from_cwd = L"test-media\\" + std::wstring(name);
+            if (file_exists_w(from_exe)) {
+                result.push_back(utf8_from_wide(from_exe));
+            } else if (file_exists_w(from_cwd)) {
+                result.push_back(utf8_from_wide(from_cwd));
+            } else {
+                result.push_back(utf8_from_wide(from_exe));   // покажем, где искали
+            }
+        }
+        return result;
+    }();
+    return files;
 }
 
 void test_real_files() {
     g_real_info.clear();
     for (size_t i = 0; i < 3; ++i) {
-        const char* path = kRealFiles[i];
-        if (!file_exists(path)) {
+        const std::string path = real_files()[i];
+        if (!file_exists_utf8(path)) {
             report(std::string("real file present: ") + path, false, "not found");
             g_real_info.push_back(tags::Info());
             continue;
@@ -617,11 +681,6 @@ std::wstring python_project_dir() {
     return L"C:\\Users\\1\\Desktop\\audio-player";
 }
 
-bool file_exists_w(const std::wstring& path) {
-    const DWORD attributes = GetFileAttributesW(path.c_str());
-    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
-}
-
 // Интерпретатор: сначала python.exe из PATH, потом привычные места установки.
 std::wstring python_executable() {
     wchar_t found[MAX_PATH] = {0};
@@ -672,7 +731,7 @@ std::string run_python_reference() {
     script += "import player\n";
     script += "files = [\n";
     for (size_t i = 0; i < 3; ++i) {
-        script += "    " + py_literal(kRealFiles[i]) + ",\n";
+        script += "    " + py_literal(real_files()[i]) + ",\n";
     }
     script += "]\n";
     script += "for p in files:\n";
