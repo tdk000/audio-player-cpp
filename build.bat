@@ -29,7 +29,7 @@ echo [1/4] resources (icon, version info)
 if errorlevel 1 goto :fail
 
 echo [2/4] player objects
-for %%S in (common media_probe player_core playlist tags miniaudio_impl ui_slider app_win32 main) do (
+for %%S in (common media_probe player_core playlist tags settings miniaudio_impl ui_slider app_win32 main) do (
     echo       %%S.cpp
     "%GXX%" %CXXFLAGS% -c src\%%S.cpp -o build\%%S.o
     if errorlevel 1 goto :fail
@@ -38,16 +38,17 @@ for %%S in (common media_probe player_core playlist tags miniaudio_impl ui_slide
 echo [3/4] linking dist\AudioPlayer.exe
 "%GXX%" %CXXFLAGS% -mwindows -static -s -o dist\AudioPlayer.exe ^
     build\common.o build\media_probe.o build\player_core.o build\playlist.o build\tags.o ^
-    build\miniaudio_impl.o build\ui_slider.o build\app_win32.o build\main.o build\resources.o ^
+    build\settings.o build\miniaudio_impl.o build\ui_slider.o build\app_win32.o build\main.o ^
+    build\resources.o ^
     -lole32 -lwinmm -luuid -luser32 -lgdi32 -lcomdlg32 -lshell32 -lshlwapi
 if errorlevel 1 goto :fail
 
-echo [4/4] linking dist\test_core.exe, dist\test_playlist.exe and dist\test_tags.exe
+echo [4/4] linking test binaries
 "%GXX%" %CXXFLAGS% -c tests\test_core.cpp -o build\test_core.o
 if errorlevel 1 goto :fail
 "%GXX%" %CXXFLAGS% -static -s -o dist\test_core.exe ^
     build\test_core.o build\common.o build\media_probe.o build\player_core.o build\playlist.o ^
-    build\tags.o build\miniaudio_impl.o ^
+    build\tags.o build\settings.o build\miniaudio_impl.o ^
     -lole32 -lwinmm -luuid
 if errorlevel 1 goto :fail
 
@@ -63,12 +64,19 @@ if errorlevel 1 goto :fail
     -lole32 -luser32
 if errorlevel 1 goto :fail
 
+"%GXX%" %CXXFLAGS% -c tests\test_settings.cpp -o build\test_settings.o
+if errorlevel 1 goto :fail
+"%GXX%" %CXXFLAGS% -static -s -o dist\test_settings.exe build\test_settings.o build\settings.o ^
+    build\common.o
+if errorlevel 1 goto :fail
+
 echo.
 echo Done:
-echo     dist\AudioPlayer.exe   - the player
-echo     dist\test_core.exe     - core self-test (run from the project root)
-echo     dist\test_playlist.exe - shuffle/repeat order self-test
-echo     dist\test_tags.exe     - tag reader self-test
+echo     dist\AudioPlayer.exe    - the player
+echo     dist\test_core.exe      - core self-test (run from the project root)
+echo     dist\test_playlist.exe  - shuffle/repeat/playlist self-test
+echo     dist\test_tags.exe      - tag reader self-test
+echo     dist\test_settings.exe  - settings save/load self-test
 popd
 exit /b 0
 

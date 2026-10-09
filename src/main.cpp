@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <objbase.h>
+#include <ole2.h>
 #include <shellapi.h>
 #include <shobjidl.h>
 
@@ -64,8 +65,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     // Своя группа в панели задач (иначе там «AudioPlayer.exe» без значка).
     SetCurrentProcessExplicitAppUserModelID(L"simple.audioplayer.2");
     setup_dpi_awareness();
-    // Диалог выбора папки (IFileOpenDialog) требует COM.
-    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // OleInitialize нужен и диалогу выбора папки (IFileOpenDialog), и приёму
+    // перетаскивания через IDropTarget: он включает COM в однопоточном режиме.
+    const HRESULT com = OleInitialize(nullptr);
 
     std::string path_from_arguments;
     int argument_count = 0;
@@ -85,7 +87,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
                   app::utf8_to_wide(error.what()) +
                   L"\n\nПроверьте, что в системе есть работающее устройство вывода звука.");
         if (SUCCEEDED(com)) {
-            CoUninitialize();
+            OleUninitialize();
         }
         return 1;
     }
@@ -95,7 +97,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         fatal(L"Не удалось создать окно",
               L"RegisterClassEx/CreateWindow завершились ошибкой.");
         if (SUCCEEDED(com)) {
-            CoUninitialize();
+            OleUninitialize();
         }
         return 1;
     }
@@ -106,7 +108,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     player.run();
 
     if (SUCCEEDED(com)) {
-        CoUninitialize();
+        OleUninitialize();
     }
     return 0;
 }

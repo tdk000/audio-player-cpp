@@ -49,6 +49,22 @@ bool write_empty(const std::filesystem::path& path) {
     return true;
 }
 
+// Записать файл «как есть», байт в байт: нужно для проверки чтения
+// плейлистов в разных кодировках.
+bool write_bytes(const std::filesystem::path& path, const std::string& data) {
+    FILE* file = _wfopen(path.wstring().c_str(), L"wb");
+    if (file == nullptr) {
+        return false;
+    }
+    const size_t written = std::fwrite(data.data(), 1, data.size(), file);
+    std::fclose(file);
+    return written == data.size();
+}
+
+std::string file_name_of(const std::string& utf8_path) {
+    return app::path_to_utf8(app::path_from_utf8(utf8_path).filename());
+}
+
 }  // namespace
 
 int main() {
@@ -205,6 +221,103 @@ int main() {
                                                     new_folder.current() >= 0 &&
                                                     new_folder.current() < 3,
           std::to_string(new_folder.current()));
+
+    std::printf("Добавление треков к текущему плейлисту\n");
+    {
+        playlist::Queue queue = make_queue(3);
+        check("старт на первом", queue.current() == 0);
+        check("next() перевёл на второй", queue.next(false) && queue.current() == 1);
+        const int playing = queue.current();
+        const int added = queue.append_tracks({"new1.mp3", "new2.mp3"});
+        check("добавлено 2 трека", added == 2, std::to_string(added));
+        check("размер стал 5", queue.size() == 5, std::to_string(queue.size()));
+        check("текущий трек не сбился", queue.current() == playing);
+        check("хвост играется по порядку", queue.next(false) && queue.current() == 2);
+
+        const int again = queue.append_tracks({"new1.mp3", "track1.mp3"});
+        check("дубликаты не добавляются", again == 0, std::to_string(again));
+        check("размер не изменился", queue.size() == 5);
+
+        playlist::Queue empty;
+        check("добавление в пустой даёт 1", empty.append_tracks({"only.mp3"}) == 1);
+        check("и сразу становится текущим", empty.current() == 0);
+        check("пустой список ничего не делает", empty.append_tracks({}) == 0);
+
+        playlist::Queue mixed;
+        mixed.set_tracks({"a.mp3", "b.mp3"});
+        mixed.set_shuffle(true);
+        const int before = mixed.current();
+        check("в перемешивании добавлено 3", mixed.append_tracks({"c.mp3", "d.mp3", "e.mp3"}) == 3);
+        check("текущий трек уцелел", mixed.current() == before);
+        check("итого 5", mixed.size() == 5);
+        std::set<int> visited;
+        visited.insert(mixed.current());
+        for (int i = 0; i < 4; ++i) {
+            check("шаг по кругу", mixed.next(false));
+            visited.insert(mixed.current());
+        }
+        check("все 5 треков достижимы", visited.size() == 5, std::to_string(visited.size()));
+    }
+
+    std::printf("Плейлисты M3U\n");
+    {
+        check("m3u распознан", playlist::is_playlist_file("list.m3u"));
+        check("m3u8 в верхнем регистре", playlist::is_playlist_file("LIST.M3U8"));
+        check("mp3 не плейлист", !playlist::is_playlist_file("song.mp3"));
+
+        // Файлы, на которые будет ссылаться плейлист.
+        std::filesystem::create_directories(tmp / "m3u sub", ec);
+        write_empty(tmp / "m3u one.mp3");
+        write_empty(tmp / "m3u two.mp3");
+        write_empty(tmp / "m3u sub" / "inner.mp3");
+        write_empty(tmp / "ignore.txt");
+
+        const std::string list_path = app::path_to_utf8(tmp / "list.m3u");
+        const std::string body =
+            "\xEF\xBB\xBF#EXTM3U\n"                 // BOM + заголовок
+            "#EXTINF:-1,Первый\n"                   // директива игнорируется
+            "m3u one.mp3\n"                         // относительный путь
+            "\n"                                    // пустая строка
+            "m3u sub\n"                             // папка раскрывается
+            "m3u one.mp3\n"                         // дубликат
+            "m3u two.mp3\r\n"                       // CRLF
+            "нет-такого-файла.mp3\n"                // отсутствующий файл
+            "ignore.txt\n";                         // не аудио
+        check("плейлист записан", write_bytes(tmp / "list.m3u", body));
+
+        const std::vector<std::string> loaded = playlist::read_m3u(list_path);
+        check("прочитано 3 трека", loaded.size() == 3, std::to_string(loaded.size()));
+        std::set<std::string> names;
+        for (const std::string& path : loaded) {
+            names.insert(file_name_of(path));
+        }
+        check("относительные пути разрешены",
+              names.count("m3u one.mp3") == 1 && names.count("m3u two.mp3") == 1);
+        check("папка внутри плейлиста раскрыта", names.count("inner.mp3") == 1);
+        check("дубликат убран", names.size() == 3);
+
+        // Старый .m3u в Windows-1251: «тест.mp3» побайтово.
+        write_empty(tmp / std::filesystem::path(L"тест.mp3"));
+        check("cp1251-плейлист записан",
+              write_bytes(tmp / "cp1251.m3u", "#EXTM3U\n\xF2\xE5\xF1\xF2.mp3\n"));
+        const std::vector<std::string> legacy = playlist::read_m3u(app::path_to_utf8(tmp / "cp1251.m3u"));
+        check("строк в cp1251-плейлисте: 1", legacy.size() == 1, std::to_string(legacy.size()));
+        if (!legacy.empty()) {
+            check("имя из cp1251 прочитано верно",
+                  file_name_of(legacy.front()) == app::wide_to_utf8(L"тест.mp3"),
+                  file_name_of(legacy.front()));
+        }
+
+        // Запись и обратное чтение.
+        const std::string saved = app::path_to_utf8(tmp / "saved.m3u");
+        check("write_m3u отработал", playlist::write_m3u(saved, loaded));
+        const std::vector<std::string> round_trip = playlist::read_m3u(saved);
+        check("round-trip сохранил 3 трека", round_trip.size() == 3,
+              std::to_string(round_trip.size()));
+        check("round-trip сохранил порядок", round_trip == loaded);
+        check("чужой путь не читается",
+              playlist::read_m3u(app::path_to_utf8(tmp / "missing.m3u")).empty());
+    }
 
     std::filesystem::remove_all(tmp, ec);
 

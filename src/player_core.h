@@ -26,6 +26,13 @@ public:
     // времени, но звук никуда не идёт (нужно тестам: тихо и без звуковой карты).
     enum class Device { Default, Null };
 
+    // Полосы эквалайзера. Реализованы узлами miniaudio: низкие и высокие —
+    // полочные фильтры, середина — пиковый. 0 дБ означает «прозрачно».
+    enum class Band { Low = 0, Mid = 1, High = 2 };
+    static constexpr int kBandCount = 3;
+    static constexpr double kMaxGainDb = 12.0;
+    static constexpr int kFadeMs = 350;          // плавный вход и затухание, мс
+
     explicit PlayerCore(double volume = app::kDefaultVolume, Device device = Device::Default);
     ~PlayerCore();
 
@@ -61,12 +68,32 @@ public:
     double change_volume(double delta);
     const std::string& path() const { return path_; }
 
+    // Эквалайзер. Выключенный эквалайзер не снимается с тракта, а обнуляется:
+    // пересборка графа на ходу щёлкает.
+    bool eq_enabled() const { return eq_enabled_; }
+    void set_eq_enabled(bool on);
+    void toggle_eq();
+    double eq_gain(Band band) const { return eq_gain_[static_cast<int>(band)]; }
+    void set_eq_gain(Band band, double gain_db);
+    void change_eq_gain(Band band, double delta_db);
+    // Готова ли цепочка фильтров (устройству может не хватить ресурсов).
+    bool eq_available() const { return eq_nodes_ready_; }
+    // Текст для строки состояния: «Эквалайзер: выкл» или «НЧ +4 · СЧ 0 · ВЧ −2 дБ».
+    std::string eq_label() const;
+
 private:
     void unload();
     void release_sound();
     void stamp() { anchor_time_ = now(); }
     double clamp_position(double seconds) const;
     static double now();
+
+    void create_eq_nodes();
+    void destroy_eq_nodes();
+    void wire_eq_input();                        // звук -> НЧ -> СЧ -> ВЧ -> выход
+    void apply_eq();                             // пересчёт коэффициентов по усилениям
+    void fade_in();                              // плавный вход при старте
+    void fade_out();                             // плавное затухание при остановке
 
     ma_context context_{};
     bool context_ready_ = false;
@@ -75,6 +102,15 @@ private:
     // Звук живём в куче: ma_sound нельзя ни копировать, ни переносить — внутри
     // граф узлов ссылается на собственные поля, и адрес должен быть стабильным.
     ma_sound* sound_ = nullptr;
+
+    // Цепочка эквалайзера. Узлы живут столько же, сколько движок, и не
+    // пересоздаются: при смене настроек меняются только коэффициенты.
+    ma_loshelf_node eq_low_{};
+    ma_peak_node eq_mid_{};
+    ma_hishelf_node eq_high_{};
+    bool eq_nodes_ready_ = false;
+    bool eq_enabled_ = false;
+    double eq_gain_[kBandCount] = {0.0, 0.0, 0.0};
 
     State state_ = State::Stopped;
     std::string path_;
