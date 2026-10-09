@@ -12,9 +12,24 @@ if "%MINGW_HOME%"=="" set "MINGW_HOME=C:\Users\1\Tools\mingw64"
 set "GXX=%MINGW_HOME%\bin\g++.exe"
 set "WINDRES=%MINGW_HOME%\bin\windres.exe"
 
+rem По этому пути инструментов может не быть — например, в CI или при установке
+rem MinGW в другое место. Тогда берём то, что уже лежит в PATH.
+if not exist "%GXX%" (
+    for %%I in (g++.exe) do if not "%%~$PATH:I"=="" set "GXX=%%~$PATH:I"
+)
+if not exist "%WINDRES%" (
+    for %%I in (windres.exe) do if not "%%~$PATH:I"=="" set "WINDRES=%%~$PATH:I"
+)
+
 if not exist "%GXX%" (
     echo [error] g++ not found: %GXX%
-    echo         Set MINGW_HOME to your MinGW-w64 folder and run again.
+    echo         Set MINGW_HOME to your MinGW-w64 folder and run again,
+    echo         or add its bin folder to PATH.
+    exit /b 1
+)
+if not exist "%WINDRES%" (
+    echo [error] windres not found: %WINDRES%
+    echo         windres ships with MinGW-w64 binutils.
     exit /b 1
 )
 
