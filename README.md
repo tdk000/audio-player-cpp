@@ -1,6 +1,6 @@
 # Простейший аудиоплеер на C++ (Windows)
 
-Тот же плеер, что и `player.py`, переписанный на C++: одно окно, ничего лишнего —
+Тот же плеер, что и [`player.py`](https://github.com/tdk000/audio-player-python/blob/main/player.py), переписанный на C++: одно окно, ничего лишнего —
 открыл MP3 → играет. **Win32 API** (интерфейс) + **miniaudio** (звук), никаких
 внешних библиотек и DLL: один портабельный exe.
 
@@ -156,7 +156,7 @@ dist\test_tags.exe      :: чтение тегов ID3v2/ID3v1/Vorbis/RIFF INFO
 выключении режима), выбор трека в списке и пустой плейлист.
 
 `test_tags.exe` прогоняет 45 проверок парсера тегов и **сверяет результат с
-Python-версией**: сам запускает `python` со старым `player.py` и сравнивает
+Python-версией**: сам запускает `python` со старым [`player.py`](https://github.com/tdk000/audio-player-python/blob/main/player.py) и сравнивает
 `read_tags` для трёх дорожек из `test-media\` (нужен Python 3 в PATH —
 без него сверка просто пропускается).
 
@@ -226,6 +226,8 @@ stb_vorbis длину не сообщает вовсе, поэтому счит�
 разбирается сам — в отличие от SDL_mixer ему не нужен файловый объект.
 
 ## Чем отличается от Python-версии
+
+Python-версия — отдельный проект: [audio-player-python](https://github.com/tdk000/audio-player-python), файл [player.py](https://github.com/tdk000/audio-player-python/blob/main/player.py).
 
 | | Python (`player.py` 1.3.0) | C++ (эта версия 2.0.0) |
 |---|---|---|
