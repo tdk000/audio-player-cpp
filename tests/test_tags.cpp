@@ -606,12 +606,69 @@ std::string py_literal(const std::string& s) {
     return out;
 }
 
+// Каталог с Python-версией плеера. По умолчанию — привычное место автора,
+// но его можно переопределить: на другой машине и в CI путь свой.
+std::wstring python_project_dir() {
+    wchar_t value[MAX_PATH] = {0};
+    const DWORD length = GetEnvironmentVariableW(L"AUDIOPLAYER_PYTHON_DIR", value, MAX_PATH);
+    if (length > 0 && length < MAX_PATH) {
+        return std::wstring(value);
+    }
+    return L"C:\\Users\\1\\Desktop\\audio-player";
+}
+
+bool file_exists_w(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+// Интерпретатор: сначала python.exe из PATH, потом привычные места установки.
+std::wstring python_executable() {
+    wchar_t found[MAX_PATH] = {0};
+    if (SearchPathW(nullptr, L"python.exe", nullptr, MAX_PATH, found, nullptr) > 0) {
+        return std::wstring(found);
+    }
+    for (const wchar_t* candidate :
+         {L"C:\\Python314\\python.exe", L"C:\\Python313\\python.exe",
+          L"C:\\Python312\\python.exe", L"C:\\Python311\\python.exe"}) {
+        if (file_exists_w(candidate)) {
+            return std::wstring(candidate);
+        }
+    }
+    return std::wstring();
+}
+
+// Путь для вставки в текст скрипта: прямые слэши, чтобы не возиться с экранированием.
+std::string python_path_literal(const std::wstring& path) {
+    const int size = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), static_cast<int>(path.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    if (size <= 0) {
+        return std::string();
+    }
+    std::string result(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, path.c_str(), static_cast<int>(path.size()),
+                        result.data(), size, nullptr, nullptr);
+    for (char& ch : result) {
+        if (ch == '\\') {
+            ch = '/';
+        }
+    }
+    return result;
+}
+
 // Запускает Python-эталон и возвращает его stdout (как есть) или "".
+// Пустая строка означает «сверить не с чем»: нет интерпретатора или player.py.
 std::string run_python_reference() {
+    const std::wstring interpreter = python_executable();
+    const std::wstring project = python_project_dir();
+    if (interpreter.empty() || !file_exists_w(project + L"\\player.py")) {
+        return std::string();
+    }
+
     std::string script;
     script += "import sys\n";
     script += "sys.stdout.reconfigure(encoding='utf-8')\n";
-    script += "sys.path.insert(0, r'C:\\Users\\1\\Desktop\\audio-player')\n";
+    script += "sys.path.insert(0, r'" + python_path_literal(project) + "')\n";
     script += "import player\n";
     script += "files = [\n";
     for (size_t i = 0; i < 3; ++i) {
@@ -642,7 +699,7 @@ std::string run_python_reference() {
     si.hStdError = write_pipe;
 
     PROCESS_INFORMATION pi = {};
-    std::wstring cmdline = L"\"C:\\Python314\\python.exe\" \"" + wide_script + L"\"";
+    std::wstring cmdline = L"\"" + interpreter + L"\" \"" + wide_script + L"\"";
     std::vector<wchar_t> cmdline_buffer(cmdline.begin(), cmdline.end());
     cmdline_buffer.push_back(L'\0');  // CreateProcessW правит буфер на месте
 
@@ -691,6 +748,11 @@ std::vector<std::string> split_lines(const std::string& text) {
 void test_python_reference() {
     std::printf("    --- Python reference (player.read_tags) ---\n");
     const std::string raw = run_python_reference();
+    if (raw.empty()) {
+        std::printf("    пропущено: не найден python.exe или player.py "
+                    "(путь задаётся переменной AUDIOPLAYER_PYTHON_DIR)\n");
+        return;                                  // сверка необязательна, это не провал
+    }
     const std::vector<std::string> lines = split_lines(raw);
 
     // Первые 3 строки — это наши файлы; лишние (предупреждения) печатаем как есть.
