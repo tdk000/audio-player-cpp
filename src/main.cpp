@@ -59,6 +59,21 @@ void fatal(const wchar_t* title, const std::wstring& text) {
     MessageBoxW(nullptr, text.c_str(), title, MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
 }
 
+// Запуск с файлом не должен плодить процессы: если предыдущая копия плеера ещё
+// играет, закрываем её окна по классу и дожидаемся выхода. WM_CLOSE — тот же
+// путь, что и клик по крестику: настройки сохранятся, звук остановится мягко.
+// Ждём не дольше секунды: если старый экземпляр завис, новый всё равно откроется.
+void close_previous_instances() {
+    for (int attempt = 0; attempt < 30; ++attempt) {
+        const HWND previous = FindWindowW(kWindowClass, nullptr);
+        if (previous == nullptr) {
+            return;
+        }
+        PostMessageW(previous, WM_CLOSE, 0, 0);
+        Sleep(30);
+    }
+}
+
 }  // namespace
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
@@ -76,6 +91,12 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
             path_from_arguments = app::wide_to_utf8(arguments[1]);
         }
         LocalFree(arguments);
+    }
+
+    // Старые копии закрываем до инициализации звука: они успевают дописать
+    // настройки, и новый экземпляр прочитает уже их.
+    if (!path_from_arguments.empty()) {
+        close_previous_instances();
     }
 
     std::unique_ptr<PlayerCore> core;

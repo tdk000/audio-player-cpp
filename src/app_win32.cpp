@@ -22,7 +22,6 @@
 
 namespace {
 
-constexpr const wchar_t* kWindowClass = L"DshAudioPlayerWindow";
 constexpr const wchar_t* kOpenFileFilter =
     L"Аудио и плейлисты (*.mp3;*.wav;*.ogg;*.oga;*.flac;*.m3u;*.m3u8)\0"
     L"*.mp3;*.wav;*.ogg;*.oga;*.flac;*.m3u;*.m3u8\0"

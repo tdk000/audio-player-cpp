@@ -11,6 +11,11 @@
 #include "playlist.h"
 #include "ui_theme.h"
 
+// Класс главного окна. Живёт в заголовке, чтобы новый экземпляр плеера мог
+// найти по нему окна предыдущих копий и закрыть их (иначе открытие файла из
+// Проводника запускает второй процесс, а первый продолжает играть).
+inline constexpr wchar_t kWindowClass[] = L"DshAudioPlayerWindow";
+
 class PlayerDropTarget;
 
 class PlayerApp {
