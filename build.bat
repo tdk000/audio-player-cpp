@@ -4,11 +4,13 @@ rem
 rem Usage:
 rem     build.bat
 rem
-rem If MinGW is not in C:\Users\<user>\Tools\mingw64, set MINGW_HOME first:
+rem MinGW is expected in the current user's Tools folder:
+rem     C:\Users\<you>\Tools\mingw64
+rem If it lives elsewhere, set MINGW_HOME first:
 rem     set MINGW_HOME=C:\mingw64
 setlocal
 set "ROOT=%~dp0"
-if "%MINGW_HOME%"=="" set "MINGW_HOME=C:\Users\<user>\Tools\mingw64"
+if "%MINGW_HOME%"=="" set "MINGW_HOME=C:\Users\%USERNAME%\Tools\mingw64"
 set "GXX=%MINGW_HOME%\bin\g++.exe"
 set "WINDRES=%MINGW_HOME%\bin\windres.exe"
 
